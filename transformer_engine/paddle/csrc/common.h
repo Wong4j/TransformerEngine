@@ -9,6 +9,7 @@
 #include <transformer_engine/cast.h>
 #include <transformer_engine/gemm.h>
 #include <transformer_engine/logging.h>
+#include <transformer_engine/rmsnorm.h>
 #include <transformer_engine/transformer_engine.h>
 #include <vector>
 

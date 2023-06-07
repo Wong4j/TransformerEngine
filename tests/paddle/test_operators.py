@@ -7,11 +7,20 @@ import pytest
 import paddle
 from utils import assert_allclose, create_fp8_meta
 
-import transformer_engine    # pylint: disable=unused-import
-import transformer_engine_paddle as tex    # pylint: disable=wrong-import-order
-
-from transformer_engine.paddle.cpp_extensions import cast_to_fp8, cast_from_fp8, gemm, fp8_gemm
+from transformer_engine.paddle.cpp_extensions import (
+    cast_to_fp8,
+    cast_from_fp8,
+    gemm,
+    fp8_gemm,
+    layernorm_fwd_fp8,
+    layernorm_fwd,
+    layernorm_bwd,
+    rmsnorm_fwd_fp8,
+    rmsnorm_fwd,
+    rmsnorm_bwd,
+)
 from transformer_engine.paddle.fp8 import is_fp8_available
+import transformer_engine_paddle as tex    # pylint: disable=wrong-import-order
 
 paddle.seed(10)
 GEMM_CASES = [(256, 256, 512), (32, 32, 32), (16384, 1024, 2816), (16384, 2816, 1024),
@@ -114,3 +123,194 @@ class TestGemm:
                               tex.FP8FwdTensors.GEMM1_INPUT, fp8_dtype, out_dtype, workspace)
 
         assert_allclose(actual_out, ref_out)
+
+
+class TestLayerNorm:
+    """
+    Test layernorm operators
+    """
+
+    @staticmethod
+    def calc_fwd_ref(x, eps, gamma, beta):
+        """
+        Calculate reference using paddle layer_norm op
+        """
+        y = paddle.nn.functional.layer_norm(x=x,
+                                            normalized_shape=x.shape[1:],
+                                            weight=gamma,
+                                            bias=beta,
+                                            epsilon=eps)
+        mean = paddle.mean(x, axis=-1)
+        var = paddle.var(x, axis=-1)
+        inv_var = paddle.sqrt(1. / var)
+        return y, mean, inv_var
+
+    @staticmethod
+    def calc_bwd_ref(x, eps, gamma, beta, dy):
+        """
+        Calculate reference using paddle layer_norm op
+        """
+        x.stop_gradient = False
+        gamma.stop_gradient = False
+        beta.stop_gradient = False
+
+        y = paddle.nn.functional.layer_norm(x=x,
+                                            normalized_shape=x.shape[1:],
+                                            weight=gamma,
+                                            bias=beta,
+                                            epsilon=eps)
+
+        paddle.autograd.backward([y], [dy], True)
+
+        return x.grad, gamma.grad, beta.grad
+
+    def test_layernorm_fwd(self):
+        """
+        Test BF16 LayerNorm Forward
+        """
+        N, H = (16, 32)
+        eps = 1e-3
+        x = paddle.uniform(shape=(N, H), dtype='bfloat16')
+        gamma = paddle.uniform(shape=(H,), dtype='bfloat16')
+        beta = paddle.uniform(shape=(H,), dtype='bfloat16')
+
+        y, mu, rsigma = layernorm_fwd(x, gamma, beta, eps, tex.DType.kBFloat16)
+
+        y_ref, mu_ref, rsigma_ref = self.calc_fwd_ref(x, eps, gamma, beta)
+
+        assert_allclose(y, y_ref, rtol=1e-5, atol=1e-5)
+        assert_allclose(mu, mu_ref, rtol=1e-3, atol=1e-3)
+        assert_allclose(rsigma, rsigma_ref, rtol=5e-2, atol=5e-2)
+
+    @staticmethod
+    def test_layernorm_fwd_fp8():
+        """
+        Test FP8 LayerNorm Forward
+        """
+        fp8_dtype = tex.DType.kFloat8E4M3
+        N, H = (16, 32)
+        eps = 1e-3
+
+        x = paddle.uniform(shape=(N, H), dtype='float32')
+        gamma = paddle.uniform(shape=(H,), dtype='float32')
+        beta = paddle.uniform(shape=(H,), dtype='float32')
+
+        fp8_tensor = tex.FP8FwdTensors.GEMM1_INPUT
+        fp8_meta = create_fp8_meta(num_fp8_tensors=1, amax_history_len=1)
+
+        y_ref, mu_ref, rsigma_ref = layernorm_fwd(x, gamma, beta, eps, tex.DType.kFloat32)
+
+        y_fp8, mu, rsigma = layernorm_fwd_fp8(x, gamma, beta, eps, fp8_meta, fp8_tensor, fp8_dtype)
+
+        y = cast_from_fp8(y_fp8, fp8_meta, fp8_tensor, itype=fp8_dtype, otype=tex.DType.kFloat32)
+
+        assert_allclose(y, y_ref, rtol=0.1, atol=0.01)
+        assert_allclose(mu, mu_ref)
+        assert_allclose(rsigma, rsigma_ref)
+
+    def test_layernorm_bwd(self):
+        """
+        Test BF16 LayerNorm Backward
+        """
+        N, H = (16, 32)
+        eps = 1e-3
+        x = paddle.uniform(shape=(N, H), dtype='bfloat16')
+        dy = paddle.uniform(shape=(N, H), dtype='bfloat16')
+        gamma = paddle.uniform(shape=(H,), dtype='bfloat16')
+        beta = paddle.uniform(shape=(H,), dtype='bfloat16')
+
+        dx_ref, dgamma_ref, dbeta_ref = self.calc_bwd_ref(x, eps, gamma, beta, dy)
+
+        _, mu, rsigma = layernorm_fwd(x, gamma, beta, eps, tex.DType.kBFloat16)
+        dx, dgamma, dbeta = layernorm_bwd(dy, x, mu, rsigma, gamma)
+
+        assert_allclose(dx, dx_ref, rtol=1e-5, atol=1e-5)
+        assert_allclose(dgamma, dgamma_ref, rtol=1e-5, atol=1e-5)
+        assert_allclose(dbeta, dbeta_ref, rtol=1e-5, atol=1e-5)
+
+
+class TestRMSNorm:
+    """
+    Test rmsnorm operators
+    """
+
+    @staticmethod
+    def calc_fwd_ref(x, eps, gamma):
+        """
+        Calculate rmsnorm reference using paddle op
+        """
+
+        norm = paddle.rsqrt(paddle.mean(x**2, axis=-1, keepdim=True) + eps)
+        y = x * norm * gamma
+
+        return y
+
+    def calc_bwd_ref(self, x, eps, gamma, dy):
+        """
+        Calculate rmsnorm bwd reference using paddle op
+        """
+        x.stop_gradient = False
+        gamma.stop_gradient = False
+
+        y = self.calc_fwd_ref(x, eps, gamma)
+
+        paddle.autograd.backward([y], [dy], True)
+
+        return x.grad, gamma.grad
+
+    def test_rmsnorm_fwd(self):
+        """
+        Test BF16 RMSNorm Forward
+        """
+        N, H = (16, 32)
+        eps = 1e-3
+        x = paddle.uniform(shape=(N, H), dtype='bfloat16')
+        gamma = paddle.uniform(shape=(H,), dtype='bfloat16')
+
+        y, _ = rmsnorm_fwd(x, gamma, eps, tex.DType.kBFloat16)
+
+        y_ref = self.calc_fwd_ref(x, eps, gamma)
+
+        assert_allclose(y, y_ref, rtol=1e-2, atol=1e-2)
+
+    @staticmethod
+    def test_rmsnorm_fwd_fp8():
+        """
+        Test FP8 RMSNorm Forward
+        """
+        fp8_dtype = tex.DType.kFloat8E4M3
+        N, H = (16, 32)
+        eps = 1e-3
+
+        x = paddle.uniform(shape=(N, H), dtype='float32')
+        gamma = paddle.uniform(shape=(H,), dtype='float32')
+
+        fp8_tensor = tex.FP8FwdTensors.GEMM1_INPUT
+        fp8_meta = create_fp8_meta(num_fp8_tensors=1, amax_history_len=1)
+
+        y_ref, rsigma_ref = rmsnorm_fwd(x, gamma, eps, tex.DType.kFloat32)
+
+        y_fp8, rsigma = rmsnorm_fwd_fp8(x, gamma, eps, fp8_meta, fp8_tensor, fp8_dtype)
+
+        y = cast_from_fp8(y_fp8, fp8_meta, fp8_tensor, itype=fp8_dtype, otype=tex.DType.kFloat32)
+
+        assert_allclose(y, y_ref, rtol=0.1, atol=0.01)
+        assert_allclose(rsigma, rsigma_ref)
+
+    def test_rmsnorm_bwd(self):
+        """
+        Test BF16 RMSNorm Backward
+        """
+        N, H = (16, 32)
+        eps = 1e-3
+        x = paddle.uniform(shape=(N, H), dtype='bfloat16')
+        dy = paddle.uniform(shape=(N, H), dtype='bfloat16')
+        gamma = paddle.uniform(shape=(H,), dtype='bfloat16')
+
+        dx_ref, dgamma_ref = self.calc_bwd_ref(x, eps, gamma, dy)
+
+        _, rsigma = rmsnorm_fwd(x, gamma, eps, tex.DType.kBFloat16)
+        dx, dgamma = rmsnorm_bwd(dy, x, rsigma, gamma)
+
+        assert_allclose(dx, dx_ref, rtol=1e-2, atol=1e-2)
+        assert_allclose(dgamma, dgamma_ref, rtol=1e-2, atol=1e-2)
