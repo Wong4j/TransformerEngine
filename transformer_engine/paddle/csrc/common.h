@@ -7,6 +7,7 @@
 
 #include <cublasLt.h>
 #include <transformer_engine/cast.h>
+#include <transformer_engine/fused_attn.h>
 #include <transformer_engine/gemm.h>
 #include <transformer_engine/logging.h>
 #include <transformer_engine/rmsnorm.h>
@@ -138,7 +139,9 @@ inline DType Int2NvteDType(int64_t dtype) {
 }
 
 // NVTE Tensor Utils
-TensorWrapper MakeNvteTensor(void *data_ptr, const std::vector<size_t> &shape, const DType type);
+TensorWrapper MakeNvteTensor(const void *data_ptr, const std::vector<size_t> &shape,
+                             const DType type);
+TensorWrapper MakeNvteTensor(void *data_ptr, const NVTEShape &shape, const DType type);
 TensorWrapper MakeNvteTensor(void *data_ptr, const std::vector<size_t> &shape, const DType type,
                              void *amax_ptr, void *scale_ptr, void *scale_inv_ptr);
 TensorWrapper MakeNvteTensor(const paddle::Tensor &tensor);
