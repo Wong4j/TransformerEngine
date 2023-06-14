@@ -29,6 +29,12 @@ from transformer_engine.paddle.cpp_extensions import (
     fused_attn_bwd_qkvpacked,
     fused_attn_fwd_kvpacked,
     fused_attn_bwd_kvpacked,
+    scaled_softmax_forward,
+    scaled_softmax_backward,
+    scaled_masked_softmax_forward,
+    scaled_masked_softmax_backward,
+    scaled_upper_triang_masked_softmax_forward,
+    scaled_upper_triang_masked_softmax_backward,
 )
 from transformer_engine.paddle.fp8 import is_fp8_available
 import transformer_engine_paddle as tex    # pylint: disable=wrong-import-order
@@ -707,3 +713,80 @@ class TestFusedAttn:
         assert_allclose(q_grad_ref, q_grad, rtol=1e-3, atol=1e-2)
         assert_allclose(k_grad_ref, k_grad, rtol=1e-3, atol=1e-2)
         assert_allclose(v_grad_ref, v_grad, rtol=1e-3, atol=1e-2)
+
+
+class TestSoftmax:
+    """
+    Test softmax operators
+    """
+
+    @pytest.mark.parametrize('dtype', ['float16', 'bfloat16'])
+    def test_scaled_softmax_fwd_bwd(self, dtype):
+        """test scaled softmax"""
+        B, H, S = (16, 4, 32)
+        scale = 0.8
+
+        x = paddle.uniform(shape=(B, H, S, S), dtype=dtype)
+        x.stop_gradient = False
+        dy = paddle.uniform(shape=(B, H, S, S), dtype=dtype)
+
+        y_ref = F.softmax(scale * x)
+        y = scaled_softmax_forward(x, scale)
+
+        paddle.autograd.backward([y_ref], [dy], True)
+        dx_ref = x.grad
+        dx = scaled_softmax_backward(dy, y, scale)
+
+        assert_allclose(y_ref, y, rtol=1e-4, atol=1e-3)
+        assert_allclose(dx_ref, dx, rtol=1e-4, atol=1e-3)
+
+    @pytest.mark.parametrize('dtype', ['float16', 'bfloat16'])
+    def test_scaled_masked_softmax_fwd_bwd(self, dtype):
+        """test scaled masked softmax"""
+        B, H, S = (16, 4, 32)
+        scale = 0.8
+
+        x = paddle.uniform(shape=(B, H, S, S), dtype=dtype)
+        x.stop_gradient = False
+        dy = paddle.uniform(shape=(B, H, S, S), dtype=dtype)
+        mask = paddle.reshape(x[0, 0] > 0.3, shape=(1, 1, S, S))
+        mask_flipped = x[0, 0] <= 0.3
+        mask_ref = (mask_flipped.astype(dtype) - 1.0) * 1e4
+
+        y_ref = F.softmax(scale * x + mask_ref)
+        y = scaled_masked_softmax_forward(x, mask, scale)
+
+        paddle.autograd.backward([y_ref], [dy], True)
+        dx_ref = x.grad
+        dx = scaled_masked_softmax_backward(dy, y, scale)
+
+        assert_allclose(y_ref, y, rtol=1e-4, atol=1e-3)
+        assert_allclose(dx_ref, dx, rtol=1e-4, atol=1e-3)
+
+    @pytest.mark.parametrize('dtype', ['float16', 'bfloat16'])
+    def test_scaled_upper_triang_masked_softmax_fwd_bwd(self, dtype):
+        """test scaled upper triang masked softmax"""
+        B, S = (16, 32)
+        scale = 0.8
+
+        x = paddle.uniform(shape=(B, S, S), dtype=dtype)
+        x.stop_gradient = False
+        dy = paddle.uniform(shape=(B, S, S), dtype=dtype)
+
+        mask = paddle.ones((S, S), dtype='int32')
+        col_beg, col_end = 1, S
+        for row in range(0, S):
+            mask[row, col_beg:col_end] = 0
+            col_beg += 1
+
+        mask_ref = (mask.astype(dtype) - 1.0) * 1e4
+
+        y_ref = F.softmax(scale * x + mask_ref)
+        y = scaled_upper_triang_masked_softmax_forward(x, scale)
+
+        paddle.autograd.backward([y_ref], [dy], True)
+        dx_ref = x.grad
+        dx = scaled_upper_triang_masked_softmax_backward(dy, y, scale)
+
+        assert_allclose(y_ref, y, rtol=1e-4, atol=5e-3)
+        assert_allclose(dx_ref, dx, rtol=1e-4, atol=5e-3)

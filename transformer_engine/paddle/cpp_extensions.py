@@ -678,3 +678,59 @@ def fused_attn_bwd_kvpacked(
         int(qkv_dtype),
     )
     return dq, dkv, dbias
+
+
+def scaled_softmax_forward(
+    inp: paddle.Tensor,
+    scale_factor: float,
+) -> paddle.Tensor:
+    """ scaled softmax forward"""
+    return tex.te_scaled_softmax_forward(inp, scale_factor)
+
+
+def scaled_softmax_backward(
+    out_grad: paddle.Tensor,
+    softmax_results: paddle.Tensor,
+    scale_factor: float,
+) -> paddle.Tensor:
+    """ scaled softmax backward"""
+    tex.te_scaled_softmax_backward(out_grad, softmax_results, scale_factor)
+    return out_grad
+
+
+def scaled_masked_softmax_forward(
+    inp: paddle.Tensor,
+    mask: paddle.Tensor,
+    scale_factor: float,
+) -> paddle.Tensor:
+    """ scaled masked softmax forward"""
+
+    return tex.te_scaled_masked_softmax_forward(inp, mask, scale_factor)
+
+
+def scaled_masked_softmax_backward(
+    out_grad: paddle.Tensor,
+    softmax_results: paddle.Tensor,
+    scale_factor: float,
+) -> paddle.Tensor:
+    """ scaled masked softmax backward"""
+    tex.te_scaled_softmax_backward(out_grad, softmax_results, scale_factor)
+    return out_grad
+
+
+def scaled_upper_triang_masked_softmax_forward(
+    inp: paddle.Tensor,
+    scale_factor: float,
+) -> paddle.Tensor:
+    """ scaled upper triang masked softmax forward"""
+    return tex.te_scaled_upper_triang_masked_softmax_forward(inp, scale_factor)
+
+
+def scaled_upper_triang_masked_softmax_backward(
+    out_grad: paddle.Tensor,
+    softmax_results: paddle.Tensor,
+    scale_factor: float,
+) -> paddle.Tensor:
+    """ scaled upper triang masked softmax backward"""
+    tex.te_scaled_upper_triang_masked_softmax_backward(out_grad, softmax_results, scale_factor)
+    return out_grad

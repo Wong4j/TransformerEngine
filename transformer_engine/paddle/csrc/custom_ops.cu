@@ -818,6 +818,154 @@ void te_fused_attn_bwd_kvpacked(const paddle::Tensor &Q, const paddle::Tensor &K
     nvte_tensor_pack_destroy(&nvte_aux_tensor_pack);
 }
 
+std::vector<paddle::Tensor> te_scaled_softmax_forward(const paddle::Tensor &input,
+                                                      float scale_factor) {
+    NVTE_CHECK(input.shape().size() == 4, "expected 4D tensor");
+    NVTE_CHECK((input.dtype() == paddle::DataType::FLOAT16) ||
+                   (input.dtype() == paddle::DataType::BFLOAT16),
+               "Only fp16 and bf16 are supported");
+
+    const int batches = input.shape()[0];
+    const int attn_heads = input.shape()[1];
+    const int query_seq_len = input.shape()[2];
+    const int key_seq_len = input.shape()[3];
+
+    NVTE_CHECK(key_seq_len <= 4096);
+    NVTE_CHECK(query_seq_len > 1);
+
+    // Output
+    auto softmax_results = paddle::empty_like(input, input.dtype(), input.place());
+
+    auto input_cu = MakeNvteTensor(input);
+    auto softmax_results_cu = MakeNvteTensor(softmax_results);
+
+    nvte_scaled_softmax_forward(input_cu.data(), softmax_results_cu.data(), scale_factor,
+                                input.stream());
+
+    return {softmax_results};
+}
+
+void te_scaled_softmax_backward(paddle::Tensor &output_grads,  // NOLINT
+                                const paddle::Tensor &softmax_results, float scale_factor) {
+    NVTE_CHECK(output_grads.shape().size() == 4, "expected 4D tensor");
+    NVTE_CHECK(softmax_results.shape().size() == 4, "expected 4D tensor");
+
+    NVTE_CHECK((output_grads.dtype() == paddle::DataType::FLOAT16) ||
+                   (output_grads.dtype() == paddle::DataType::BFLOAT16),
+               "Only fp16 and bf16 are supported");
+    NVTE_CHECK((softmax_results.dtype() == paddle::DataType::FLOAT16) ||
+                   (softmax_results.dtype() == paddle::DataType::BFLOAT16),
+               "Only fp16 and bf16 are supported");
+
+    auto output_grads_cu = MakeNvteTensor(output_grads);
+    auto softmax_results_cu = MakeNvteTensor(softmax_results);
+
+    // Produce gradients in place.
+    nvte_scaled_softmax_backward(output_grads_cu.data(), softmax_results_cu.data(),
+                                 output_grads_cu.data(), scale_factor, softmax_results.stream());
+}
+
+std::vector<paddle::Tensor> te_scaled_masked_softmax_forward(const paddle::Tensor &input,
+                                                             const paddle::Tensor &mask,
+                                                             float scale_factor) {
+    NVTE_CHECK(input.shape().size() == 4, "expected 4D tensor");
+    NVTE_CHECK(mask.shape().size() == 4, "expected 4D tensor");
+    NVTE_CHECK((input.dtype() == paddle::DataType::FLOAT16) ||
+                   (input.dtype() == paddle::DataType::BFLOAT16),
+               "Only fp16 and bf16 are supported");
+
+    const int batches = input.shape()[0];
+    const int pad_batches = mask.shape()[0];
+    const int attn_heads = input.shape()[1];
+    const int query_seq_len = input.shape()[2];
+    const int key_seq_len = input.shape()[3];
+
+    NVTE_CHECK(key_seq_len <= 4096);
+    NVTE_CHECK(query_seq_len > 1);
+    NVTE_CHECK(pad_batches == 1 || pad_batches == batches);
+    NVTE_CHECK(mask.shape()[1] == 1);
+    NVTE_CHECK(mask.shape()[2] == query_seq_len);
+    NVTE_CHECK(mask.shape()[3] == key_seq_len);
+
+    // Output
+    auto softmax_results = paddle::empty_like(input, input.dtype(), input.place());
+
+    auto input_cu = MakeNvteTensor(input);
+    auto mask_cu = MakeNvteTensor(mask);
+    auto softmax_results_cu = MakeNvteTensor(softmax_results);
+
+    nvte_scaled_masked_softmax_forward(input_cu.data(), mask_cu.data(), softmax_results_cu.data(),
+                                       scale_factor, input.stream());
+
+    return {softmax_results};
+}
+
+void te_scaled_masked_softmax_backward(paddle::Tensor &output_grads,  // NOLINT
+                                       const paddle::Tensor &softmax_results, float scale_factor) {
+    NVTE_CHECK(output_grads.shape().size() == 4, "expected 4D tensor");
+    NVTE_CHECK(softmax_results.shape().size() == 4, "expected 4D tensor");
+
+    NVTE_CHECK((output_grads.dtype() == paddle::DataType::FLOAT16) ||
+                   (output_grads.dtype() == paddle::DataType::BFLOAT16),
+               "Only fp16 and bf16 are supported");
+    NVTE_CHECK((softmax_results.dtype() == paddle::DataType::FLOAT16) ||
+                   (softmax_results.dtype() == paddle::DataType::BFLOAT16),
+               "Only fp16 and bf16 are supported");
+
+    auto output_grads_cu = MakeNvteTensor(output_grads);
+    auto softmax_results_cu = MakeNvteTensor(softmax_results);
+
+    // Produce gradients in place.
+    nvte_scaled_softmax_backward(output_grads_cu.data(), softmax_results_cu.data(),
+                                 output_grads_cu.data(), scale_factor, softmax_results.stream());
+}
+
+std::vector<paddle::Tensor> te_scaled_upper_triang_masked_softmax_forward(
+    const paddle::Tensor &input, float scale_factor) {
+    NVTE_CHECK(input.shape().size() == 3, "expected 3D tensor");
+    NVTE_CHECK((input.dtype() == paddle::DataType::FLOAT16) ||
+                   (input.dtype() == paddle::DataType::BFLOAT16),
+               "Only fp16 and bf16 are supported");
+
+    const int attn_batches = input.shape()[0];
+    const int seq_len = input.shape()[1];
+    NVTE_CHECK(seq_len <= 2048);
+
+    // Output
+    auto softmax_results = paddle::empty_like(input, input.dtype(), input.place());
+
+    auto input_cu = MakeNvteTensor(input);
+    auto softmax_results_cu = MakeNvteTensor(softmax_results);
+
+    nvte_scaled_upper_triang_masked_softmax_forward(input_cu.data(), softmax_results_cu.data(),
+                                                    scale_factor, input.stream());
+
+    return {softmax_results};
+}
+
+void te_scaled_upper_triang_masked_softmax_backward(paddle::Tensor &output_grads,  // NOLINT
+                                                    const paddle::Tensor &softmax_results,
+                                                    float scale_factor) {
+    NVTE_CHECK(output_grads.shape().size() == 3, "expected 4D tensor");
+    NVTE_CHECK(softmax_results.shape().size() == 3, "expected 4D tensor");
+
+    NVTE_CHECK((output_grads.dtype() == paddle::DataType::FLOAT16) ||
+                   (output_grads.dtype() == paddle::DataType::BFLOAT16),
+               "Only fp16 and bf16 are supported");
+    NVTE_CHECK((softmax_results.dtype() == paddle::DataType::FLOAT16) ||
+                   (softmax_results.dtype() == paddle::DataType::BFLOAT16),
+               "Only fp16 and bf16 are supported");
+    NVTE_CHECK(output_grads.shape()[1] == output_grads.shape()[2]);
+
+    auto output_grads_cu = MakeNvteTensor(output_grads);
+    auto softmax_results_cu = MakeNvteTensor(softmax_results);
+
+    // Produce gradients in place.
+    nvte_scaled_upper_triang_masked_softmax_backward(
+        output_grads_cu.data(), softmax_results_cu.data(), output_grads_cu.data(), scale_factor,
+        softmax_results.stream());
+}
+
 }  // namespace paddle_ext
 }  // namespace transformer_engine
 
@@ -969,3 +1117,44 @@ PD_BUILD_OP(te_fused_attn_bwd_kvpacked)
                     {"_dKV", "dKV"},
                     {paddle::Optional("_dBias"), paddle::Optional("dBias")}})
     .SetKernelFn(PD_KERNEL(transformer_engine::paddle_ext::te_fused_attn_bwd_kvpacked));
+
+PD_BUILD_OP(te_scaled_softmax_forward)
+    .Inputs({"input"})
+    .Outputs({"softmax_results"})
+    .Attrs({"scale_factor: float"})
+    .SetKernelFn(PD_KERNEL(transformer_engine::paddle_ext::te_scaled_softmax_forward));
+
+PD_BUILD_OP(te_scaled_softmax_backward)
+    .Inputs({"out_grad_", "softmax_results"})
+    .Outputs({"out_grad"})
+    .Attrs({"scale_factor: float"})
+    .SetInplaceMap({{"out_grad_", "out_grad"}})
+    .SetKernelFn(PD_KERNEL(transformer_engine::paddle_ext::te_scaled_softmax_backward));
+
+PD_BUILD_OP(te_scaled_masked_softmax_forward)
+    .Inputs({"input", "mask"})
+    .Outputs({"softmax_results"})
+    .Attrs({"scale_factor: float"})
+    .SetKernelFn(PD_KERNEL(transformer_engine::paddle_ext::te_scaled_masked_softmax_forward));
+
+PD_BUILD_OP(te_scaled_masked_softmax_backward)
+    .Inputs({"out_grad_", "softmax_results"})
+    .Outputs({"out_grad"})
+    .Attrs({"scale_factor: float"})
+    .SetInplaceMap({{"out_grad_", "out_grad"}})
+    .SetKernelFn(PD_KERNEL(transformer_engine::paddle_ext::te_scaled_masked_softmax_backward));
+
+PD_BUILD_OP(te_scaled_upper_triang_masked_softmax_forward)
+    .Inputs({"input"})
+    .Outputs({"softmax_results"})
+    .Attrs({"scale_factor: float"})
+    .SetKernelFn(
+        PD_KERNEL(transformer_engine::paddle_ext::te_scaled_upper_triang_masked_softmax_forward));
+
+PD_BUILD_OP(te_scaled_upper_triang_masked_softmax_backward)
+    .Inputs({"out_grad_", "softmax_results"})
+    .Outputs({"out_grad"})
+    .Attrs({"scale_factor: float"})
+    .SetInplaceMap({{"out_grad_", "out_grad"}})
+    .SetKernelFn(
+        PD_KERNEL(transformer_engine::paddle_ext::te_scaled_upper_triang_masked_softmax_backward));
