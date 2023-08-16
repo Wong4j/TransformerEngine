@@ -11,15 +11,14 @@ import paddle
 from paddle import nn
 import paddle.nn.functional as F
 import nltk
-import numpy as np
-import optax
-from datasets import load_dataset
 from paddle.metric import Accuracy
 from paddle.io import DataLoader
+from paddlenlp.data import Dict, Pad, Stack
+from paddlenlp.datasets import load_dataset
+from paddlenlp.transformers import BertTokenizer
 
 import transformer_engine.paddle as te
-import transformer_engine.paddle.fp8 as is_fp8_available
-
+from transformer_engine.paddle.fp8 import is_fp8_available
 
 
 class Net(nn.Layer):
@@ -34,31 +33,32 @@ class Net(nn.Layer):
         self.num_heads = 16
         self.intermediate_size = 4096
 
-
         self.embedding = nn.Embedding(num_embeddings=self.num_embed, embedding_dim=self.hidden_size)
-        if self.use_te == False:
-            self.encoder_layer = nn.TransformerEncoderLayer(
-                self.hidden_size,
-                self.num_heads,
-                self.intermediate_size,
-                dropout=0,
-                activation='gelu',
-                attn_dropout=0,
-                act_dropout=0,
-                normalize_before=False)
-        else: 
-            self.encoder_layer = te.TransformerLayer(
-                self.hidden_size,
-                self.ffn_hidden_size,
-                self.num_heads,
-                layernorm_epsilon=1e-5,
-                hidden_dropout=0.0,
-                attention_dropout=0.0,
-                self_attn_mask_type='padding',
-                apply_residual_connection_post_layernorm=False,
-                output_layernorm=True,
-                layer_type='encoder',
-                backend='transformer_engine')
+        backend = 'transformer_engine'
+        if self.use_te is False:
+            backend = "paddle"
+
+
+#            self.encoder_layer = nn.TransformerEncoderLayer(
+#                self.hidden_size,
+#                self.num_heads,
+#                self.intermediate_size,
+#                dropout=0,
+#                activation='gelu',
+#                attn_dropout=0,
+#                act_dropout=0,
+#                normalize_before=False)
+        self.encoder_layer = te.TransformerLayer(self.hidden_size,
+                                                 self.intermediate_size,
+                                                 self.num_heads,
+                                                 layernorm_epsilon=1e-5,
+                                                 hidden_dropout=0.0,
+                                                 attention_dropout=0.0,
+                                                 self_attn_mask_type='padding',
+                                                 apply_residual_connection_post_layernorm=False,
+                                                 output_layernorm=True,
+                                                 layer_type='encoder',
+                                                 backend=backend)
 
         self.linear1 = nn.Linear(self.hidden_size, 256)
         self.linear2 = nn.Linear(256, 256)
@@ -66,7 +66,7 @@ class Net(nn.Layer):
 
     def forward(self, x, mask):
         x = self.embedding(x)
-        x = self.encoder_layer(x, attention_mask=mask)
+        x = self.encoder_layer(x, mask)
         x = x.reshape(x.shape[0], -1)
         x = self.linear1(x)
         x = self.linear2(x)
@@ -74,13 +74,16 @@ class Net(nn.Layer):
         return x
 
 
-def train(args, model, train_loader, optimizer, epoch, use_fp8):
+def train(args, model, train_data_loader, optimizer, epoch, use_fp8):
     """Training function."""
     model.train()
-    for batch_id, (data, labels) in enumerate(train_loader):
+    for batch_id, (data, mask, labels) in enumerate(train_data_loader):
+        print(f"data.shape: {data.shape}")
+        print(f"mask.shape: {mask.shape}")
+        print(f"labels.shape: {labels.shape}")
         with paddle.amp.auto_cast(dtype='bfloat16', level='O2'):    # pylint: disable=not-context-manager
             with te.fp8_autocast(enabled=use_fp8):
-                outputs = model(data)
+                outputs = model(data, mask)
             loss = F.cross_entropy(outputs, labels)
 
         loss.backward()
@@ -89,12 +92,13 @@ def train(args, model, train_loader, optimizer, epoch, use_fp8):
 
         if batch_id % args.log_interval == 0:
             print(f"Train Epoch: {epoch} "
-                  f"[{batch_id * len(data)}/{len(train_loader.dataset)} "
-                  f"({100. * batch_id / len(train_loader):.0f}%)]\t"
+                  f"[{batch_id * len(data)}/{len(train_data_loader.dataset)} "
+                  f"({100. * batch_id / len(train_data_loader):.0f}%)]\t"
                   f"Loss: {loss.item():.6f}")
             if args.dry_run:
                 return loss.item()
     return loss.item()
+
 
 def evaluate(model, test_loader, epoch, use_fp8):
     """Testing function."""
@@ -103,10 +107,10 @@ def evaluate(model, test_loader, epoch, use_fp8):
     metric.reset()
 
     with paddle.no_grad():
-        for data, labels in test_loader:
+        for data, mask, labels in test_loader:
             with paddle.amp.auto_cast(dtype='bfloat16', level='O2'):    # pylint: disable=not-context-manager
                 with te.fp8_autocast(enabled=use_fp8):
-                    outputs = model(data)
+                    outputs = model(data, mask)
                 acc = metric.compute(outputs, labels)
             metric.update(acc)
     print(f"Epoch[{epoch}] - accuracy: {metric.accumulate():.6f}")
@@ -124,56 +128,35 @@ def calibrate(model, test_loader):
                     _ = model(data)
 
 
-def data_preprocess(dataset, vocab, word_id, max_seq_len):
-    """Convert tokens to numbers."""
-    nltk.download('punkt')
-    dataset_size = len(dataset['sentence'])
-    output = np.zeros((dataset_size, max_seq_len), dtype=np.int32)
-    mask_3d = np.ones((dataset_size, max_seq_len, max_seq_len), dtype=np.uint8)
-
-    for j, sentence in enumerate(dataset['sentence']):
-        tokens = nltk.word_tokenize(sentence)
-        tensor = output[j]
-
-        for i, word in enumerate(tokens):
-            if i >= max_seq_len:
-                break
-
-            if word not in vocab:
-                vocab[word] = word_id
-                tensor[i] = word_id
-                word_id = word_id + 1
-            else:
-                tensor[i] = vocab[word]
-
-        seq_len = min(len(tokens), max_seq_len)
-        mask_2d = mask_3d[j]
-        mask_2d[:seq_len, :seq_len] = 0
-
-    new_dataset = {
-        'sentence': output,
-        'label': dataset['label'].astype(np.float32),
-        'mask': mask_3d.reshape((dataset_size, 1, max_seq_len, max_seq_len))
+def convert_example(example, tokenizer, max_length=128):
+    """convert example"""
+    labels = np.array([example["labels"]], dtype="int64")
+    mask = np.ones((1, max_length, max_length), dtype=np.bool)
+    example = tokenizer(example["sentence"], max_seq_len=max_length)
+    input_ids = example["input_ids"]
+    input_ids_pad = np.zeros((max_length), dtype=np.int64)
+    input_ids_pad[:len(input_ids)] = input_ids
+    return {
+        "input_ids": input_ids_pad,
+        "mask": mask,
+        "labels": labels,
     }
-    return new_dataset, vocab, word_id
 
 
-def get_datasets(max_seq_len):
-    """Load GLUE train and test datasets into memory."""
-    vocab = {}
-    word_id = 0
+def load_data(batch_size, max_seqlen, tokenizer):
+    """create dataloader"""
+    print("Loading data")
+    train_ds = load_dataset("glue", "cola", splits="train")
+    validation_ds = load_dataset("glue", "cola", splits="dev")
 
-    train_ds = load_dataset('glue', 'cola', split='train')
-    train_ds.set_format(type='np')
-    train_ds, vocab, word_id = data_preprocess(train_ds, vocab, word_id, max_seq_len)
+    trans_func = partial(convert_example, tokenizer=tokenizer, max_length=max_seqlen)
+    train_ds = train_ds.map(trans_func, lazy=False)
+    validation_ds = validation_ds.map(trans_func, lazy=False)
 
-    test_ds = load_dataset('glue', 'cola', split='validation')
-    test_ds.set_format(type='np')
-    test_ds, vocab, word_id = data_preprocess(test_ds, vocab, word_id, max_seq_len)
-    return train_ds, test_ds, word_id
+    train_sampler = paddle.io.BatchSampler(train_ds, batch_size=batch_size, shuffle=False)
+    validation_sampler = paddle.io.BatchSampler(validation_ds, batch_size=batch_size, shuffle=False)
 
-
-
+    return train_ds, validation_ds, train_sampler, validation_sampler
 
 
 def encoder_parser(args):
@@ -220,7 +203,12 @@ def encoder_parser(args):
         default=False,
         help="quickly check a single pass",
     )
+    parser.add_argument("--use-te",
+                        action="store_true",
+                        default=False,
+                        help="Use Transformer Engine")
     parser.add_argument("--seed", type=int, default=0, metavar="S", help="random seed (default: 0)")
+    parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--use-fp8",
                         action="store_true",
                         default=False,
@@ -232,25 +220,39 @@ def encoder_parser(args):
 def train_and_evaluate(args):
     """Execute model training and evaluation loop."""
     print(args)
-    train_ds, test_ds, num_embed = get_datasets(args.max_seq_len)
+    # train_ds, test_ds, num_embed = get_datasets(args.max_seq_len)
+    tokenizer = BertTokenizer.from_pretrained("bert-large-uncased")
+    batchify_fn = lambda samples, fn=Dict({
+        "input_ids": Pad(axis=0, pad_val=tokenizer.pad_token_id),
+        "mask": Pad(axis=0),
+        "labels": Stack(dtype="int64"),
+    }): fn(samples)
+    train_ds, dev_ds, train_sampler, dev_sampler = load_data(args.batch_size, args.max_seq_len,
+                                                             tokenizer)
 
-    input_shape = [args.batch_size, args.max_seq_len]
-    mask_shape = [args.batch_size, 1, args.max_seq_len, args.max_seq_len]
-    label_shape = [args.batch_size]
+    train_data_loader = paddle.io.DataLoader(
+        train_ds,
+        batch_sampler=train_sampler,
+        num_workers=args.workers,
+        collate_fn=batchify_fn,
+    )
+    dev_data_loader = paddle.io.DataLoader(
+        dev_ds,
+        batch_sampler=dev_sampler,
+        num_workers=args.workers,
+        collate_fn=batchify_fn,
+    )
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
-    test_loader = DataLoader(test_ds, batch_size=args.test_batch_size, shuffle=False)
-
-    model = Net(num_embed, args.use_te)
+    model = Net(30528, args.use_te)
     optimizer = paddle.optimizer.Adam(learning_rate=args.lr, parameters=model.parameters())
-    model = paddle.amp.decorate(models=model, amp_level='O2', dtype='bfloat16')
+    model = paddle.amp.decorate(models=model, level='O2', dtype='bfloat16')
 
     for epoch in range(1, args.epochs + 1):
-        loss = train(args, model, train_loader, optimizer, epoch, args.use_fp8)
-        acc = evaluate(model, test_loader, epoch, args.use_fp8)
+        loss = train(args, model, train_data_loader, optimizer, epoch, args.use_fp8)
+        acc = evaluate(model, dev_data_loader, epoch, args.use_fp8)
 
     if args.use_fp8_infer and not args.use_fp8:
-        calibrate(model, test_loader)
+        calibrate(model, dev_data_loader)
 
     if args.save_model or args.use_fp8_infer:
         paddle.save(model.state_dict(), "mnist_cnn.pdparams")
@@ -259,8 +261,8 @@ def train_and_evaluate(args):
         model.set_state_dict(weights)
         acc = evaluate(model, test_loader, 0, args.use_fp8)
 
-
     return loss, acc
+
 
 class TestEncoder(unittest.TestCase):
     """Encoder unittests"""
