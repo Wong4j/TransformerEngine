@@ -10,7 +10,6 @@ import numpy as np
 import paddle
 from paddle import nn
 import paddle.nn.functional as F
-import nltk
 from paddle.metric import Accuracy
 from paddle.io import DataLoader
 from paddlenlp.data import Dict, Pad, Stack
