@@ -51,22 +51,23 @@ class Net(nn.Layer):
                                                  self.intermediate_size,
                                                  self.num_heads,
                                                  layernorm_epsilon=1e-5,
-                                                 hidden_dropout=0.0,
-                                                 attention_dropout=0.0,
+                                                 hidden_dropout=0.1,
+                                                 attention_dropout=0.1,
                                                  self_attn_mask_type='padding',
                                                  apply_residual_connection_post_layernorm=False,
                                                  output_layernorm=True,
                                                  layer_type='encoder',
                                                  backend=backend)
 
-        self.linear1 = nn.Linear(self.hidden_size, 256)
+        self.linear1 = nn.Linear(self.hidden_size * 512, 256)
         self.linear2 = nn.Linear(256, 256)
         self.linear3 = nn.Linear(256, 2)
 
     def forward(self, x, mask):
         x = self.embedding(x)
+        x = paddle.cast(x, dtype='bfloat16')
         x = self.encoder_layer(x, mask)
-        x = x.reshape(x.shape[0], -1)
+        x = x.reshape((x.shape[0], -1))
         x = self.linear1(x)
         x = self.linear2(x)
         x = self.linear3(x)
@@ -77,9 +78,6 @@ def train(args, model, train_data_loader, optimizer, epoch, use_fp8):
     """Training function."""
     model.train()
     for batch_id, (data, mask, labels) in enumerate(train_data_loader):
-        print(f"data.shape: {data.shape}")
-        print(f"mask.shape: {mask.shape}")
-        print(f"labels.shape: {labels.shape}")
         with paddle.amp.auto_cast(dtype='bfloat16', level='O2'):    # pylint: disable=not-context-manager
             with te.fp8_autocast(enabled=use_fp8):
                 outputs = model(data, mask)
@@ -130,7 +128,7 @@ def calibrate(model, test_loader):
 def convert_example(example, tokenizer, max_length=128):
     """convert example"""
     labels = np.array([example["labels"]], dtype="int64")
-    mask = np.ones((1, max_length, max_length), dtype=np.bool)
+    mask = np.ones((1, max_length, max_length), dtype='bool')
     example = tokenizer(example["sentence"], max_seq_len=max_length)
     input_ids = example["input_ids"]
     input_ids_pad = np.zeros((max_length), dtype=np.int64)
@@ -152,7 +150,7 @@ def load_data(batch_size, max_seqlen, tokenizer):
     train_ds = train_ds.map(trans_func, lazy=False)
     validation_ds = validation_ds.map(trans_func, lazy=False)
 
-    train_sampler = paddle.io.BatchSampler(train_ds, batch_size=batch_size, shuffle=False)
+    train_sampler = paddle.io.BatchSampler(train_ds, batch_size=batch_size, shuffle=True)
     validation_sampler = paddle.io.BatchSampler(validation_ds, batch_size=batch_size, shuffle=False)
 
     return train_ds, validation_ds, train_sampler, validation_sampler
@@ -178,14 +176,14 @@ def encoder_parser(args):
     parser.add_argument(
         "--max-seq-len",
         type=int,
-        default=32,
+        default=512,
         metavar="N",
         help="maximum sequence length (default: 32)",
     )
     parser.add_argument(
         "--epochs",
         type=int,
-        default=3,
+        default=1,
         metavar="N",
         help="number of epochs to train (default: 3)",
     )
@@ -207,6 +205,13 @@ def encoder_parser(args):
                         default=False,
                         help="Use Transformer Engine")
     parser.add_argument("--seed", type=int, default=0, metavar="S", help="random seed (default: 0)")
+    parser.add_argument(
+        "--log-interval",
+        type=int,
+        default=10,
+        metavar="N",
+        help="how many batches to wait before logging training status",
+    )
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--use-fp8",
                         action="store_true",
@@ -250,15 +255,15 @@ def train_and_evaluate(args):
         loss = train(args, model, train_data_loader, optimizer, epoch, args.use_fp8)
         acc = evaluate(model, dev_data_loader, epoch, args.use_fp8)
 
-    if args.use_fp8_infer and not args.use_fp8:
-        calibrate(model, dev_data_loader)
-
-    if args.save_model or args.use_fp8_infer:
-        paddle.save(model.state_dict(), "mnist_cnn.pdparams")
-        print('Eval with reloaded checkpoint : fp8=' + str(args.use_fp8))
-        weights = paddle.load("mnist_cnn.pdparams")
-        model.set_state_dict(weights)
-        acc = evaluate(model, test_loader, 0, args.use_fp8)
+#    if args.use_fp8_infer and not args.use_fp8:
+#        calibrate(model, dev_data_loader)
+#
+#    if args.save_model or args.use_fp8_infer:
+#        paddle.save(model.state_dict(), "mnist_cnn.pdparams")
+#        print('Eval with reloaded checkpoint : fp8=' + str(args.use_fp8))
+#        weights = paddle.load("mnist_cnn.pdparams")
+#        model.set_state_dict(weights)
+#        acc = evaluate(model, dev_data_loader, 0, args.use_fp8)
 
     return loss, acc
 
@@ -287,4 +292,5 @@ class TestEncoder(unittest.TestCase):
 
 
 if __name__ == "__main__":
+    paddle.fluid.core.nvprof_enable_record_event()
     train_and_evaluate(encoder_parser(None))
