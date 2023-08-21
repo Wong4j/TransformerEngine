@@ -31,6 +31,7 @@ class Net(nn.Layer):
         self.hidden_size = 1024
         self.num_heads = 16
         self.intermediate_size = 4096
+        self.num_layers = 12
 
         self.embedding = nn.Embedding(num_embeddings=self.num_embed, embedding_dim=self.hidden_size)
         backend = 'transformer_engine'
@@ -47,17 +48,23 @@ class Net(nn.Layer):
 #                attn_dropout=0,
 #                act_dropout=0,
 #                normalize_before=False)
-        self.encoder_layer = te.TransformerLayer(self.hidden_size,
-                                                 self.intermediate_size,
-                                                 self.num_heads,
-                                                 layernorm_epsilon=1e-5,
-                                                 hidden_dropout=0.1,
-                                                 attention_dropout=0.1,
-                                                 self_attn_mask_type='padding',
-                                                 apply_residual_connection_post_layernorm=False,
-                                                 output_layernorm=True,
-                                                 layer_type='encoder',
-                                                 backend=backend)
+
+        self.encoder = nn.LayerList([
+            te.TransformerLayer(
+                self.hidden_size,
+                self.intermediate_size,
+                self.num_heads,
+                layernorm_epsilon=1e-5,
+                hidden_dropout=0.1,
+                attention_dropout=0.1,
+                self_attn_mask_type='padding',
+                apply_residual_connection_post_layernorm=False,
+                output_layernorm=True,
+                layer_type='encoder',
+                backend=backend)
+            for _ in range(self.num_layers)
+        ])
+
 
         self.linear1 = nn.Linear(self.hidden_size * 512, 256)
         self.linear2 = nn.Linear(256, 256)
@@ -66,7 +73,8 @@ class Net(nn.Layer):
     def forward(self, x, mask):
         x = self.embedding(x)
         x = paddle.cast(x, dtype='bfloat16')
-        x = self.encoder_layer(x, mask)
+        for layer in self.encoder:
+            x = layer(x, mask)
         x = x.reshape((x.shape[0], -1))
         x = self.linear1(x)
         x = self.linear2(x)
@@ -128,13 +136,11 @@ def calibrate(model, test_loader):
 def convert_example(example, tokenizer, max_length=128):
     """convert example"""
     labels = np.array([example["labels"]], dtype="int64")
-    mask = np.ones((1, max_length, max_length), dtype='bool')
-    example = tokenizer(example["sentence"], max_seq_len=max_length)
+    example = tokenizer(example["sentence"], padding='max_length', max_length=max_length, return_token_type_ids=False)
+    mask = np.zeros((1, max_length, max_length), dtype='bool')
     input_ids = example["input_ids"]
-    input_ids_pad = np.zeros((max_length), dtype=np.int64)
-    input_ids_pad[:len(input_ids)] = input_ids
     return {
-        "input_ids": input_ids_pad,
+        "input_ids": input_ids,
         "mask": mask,
         "labels": labels,
     }
@@ -147,8 +153,8 @@ def load_data(batch_size, max_seqlen, tokenizer):
     validation_ds = load_dataset("glue", "cola", splits="dev")
 
     trans_func = partial(convert_example, tokenizer=tokenizer, max_length=max_seqlen)
-    train_ds = train_ds.map(trans_func, lazy=False)
-    validation_ds = validation_ds.map(trans_func, lazy=False)
+    train_ds = train_ds.map(trans_func, lazy=True)
+    validation_ds = validation_ds.map(trans_func, lazy=True)
 
     train_sampler = paddle.io.BatchSampler(train_ds, batch_size=batch_size, shuffle=True)
     validation_sampler = paddle.io.BatchSampler(validation_ds, batch_size=batch_size, shuffle=False)
@@ -237,13 +243,11 @@ def train_and_evaluate(args):
     train_data_loader = paddle.io.DataLoader(
         train_ds,
         batch_sampler=train_sampler,
-        num_workers=args.workers,
         collate_fn=batchify_fn,
     )
     dev_data_loader = paddle.io.DataLoader(
         dev_ds,
         batch_sampler=dev_sampler,
-        num_workers=args.workers,
         collate_fn=batchify_fn,
     )
 
